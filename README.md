@@ -126,6 +126,15 @@ The first iterations are slow while `torch.compile` builds its kernels (cached i
 Checkpoints are written every 2000 iterations to `logs/<run>/`; the eval watcher scores each on all
 40 clips and appends to `logs/<run>/eval.csv`.
 
+### Experimental GAWM-inspired dynamics
+
+An optional state encoder can be trained with physical state alignment and inverse
+dynamics supervision inspired by [GAWM](https://github.com/zsibot/gawm). The
+original model remains the default. See [the experiment guide](docs/grounded-dynamics.md)
+for the three-condition comparison, training flags and simulator-free checks.
+These auxiliary objectives are experimental; the results below are the original
+upstream reproduction and do not measure this extension.
+
 ## Result (LAFAN1, 40 clips, one RTX PRO 6000 Blackwell)
 
 Evaluation return 0.824 at 1.24 h of training (paper: 0.82 at 1.2 h on an H100) and 0.829 with

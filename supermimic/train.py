@@ -25,6 +25,9 @@ parser.add_argument("--hist", type=int, default=10)
 parser.add_argument("--wm_window", type=int, default=8)
 parser.add_argument("--wm_batches", type=int, default=10)
 parser.add_argument("--wm_batch", type=int, default=2048)
+parser.add_argument("--wm_latent_dim", type=int, default=0, help="GAWM-inspired state encoder width; 0 keeps the original WM")
+parser.add_argument("--wm_state_weight", type=float, default=0.0, help="physical state alignment loss weight")
+parser.add_argument("--wm_idm_weight", type=float, default=0.0, help="inverse dynamics loss weight")
 parser.add_argument("--pi_batch", type=int, default=4096)
 parser.add_argument("--lr", type=float, default=2e-4)
 parser.add_argument("--gamma", type=float, default=0.99)
@@ -45,6 +48,14 @@ parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
 add_launcher_args(parser)
 args = parser.parse_args()
+if args.wm_latent_dim < 0:
+    parser.error("--wm_latent_dim must be nonnegative")
+if any(not math.isfinite(w) or w < 0 for w in (args.wm_state_weight, args.wm_idm_weight)):
+    parser.error("grounding weights must be finite and nonnegative")
+if (args.wm_state_weight or args.wm_idm_weight) and not args.wm_latent_dim:
+    parser.error("grounding losses require --wm_latent_dim > 0")
+if args.wm_window < 1 or args.buffer_steps < args.wm_window:
+    parser.error("require buffer_steps >= wm_window >= 1")
 
 import torch
 import torch.nn as nn
@@ -64,7 +75,6 @@ torch.manual_seed(args.seed)
 networks.AMP_DTYPE = torch.bfloat16 if args.amp == "bf16" else None
 dev = "cuda:0"
 os.makedirs(args.log_dir, exist_ok=True)
-json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent=2)
 
 kin = G1Kinematics(dev)
 motion = MotionLib.from_dir(args.motion_dir, kin, dev)
@@ -73,7 +83,7 @@ K, Hh, HZ = args.goal_frames, args.hist, args.horizon
 GOAL_DIM = 73 * K
 CRITIC_IN = INV_DIM + CRITIC_EXTRA + GOAL_DIM
 
-wm = WorldModel().to(dev)
+wm = WorldModel(latent_dim=args.wm_latent_dim).to(dev)
 pi = Policy(OBS_DIM, GOAL_DIM, hist=Hh).to(dev)
 critic = Critic(CRITIC_IN).to(dev)
 opt_wm = torch.optim.Adam(wm.parameters(), lr=args.lr)
@@ -82,9 +92,14 @@ opt_v = torch.optim.Adam(critic.parameters(), lr=args.lr)
 start_it, wall_offset, sim_steps = 0, 0.0, 0
 if args.resume:
     ck = torch.load(args.resume, map_location=dev)
+    for name in ("wm_latent_dim", "wm_state_weight", "wm_idm_weight"):
+        if ck["args"].get(name, 0) != getattr(args, name):
+            raise ValueError(f"--{name} must match the resumed checkpoint")
     wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck["pi"]), critic.load_state_dict(ck["critic"])
     opt_wm.load_state_dict(ck["opt_wm"]), opt_pi.load_state_dict(ck["opt_pi"]), opt_v.load_state_dict(ck["opt_v"])
     start_it, wall_offset, sim_steps = ck["iteration"], ck["wall_time"], ck["sim_steps"]
+with open(os.path.join(args.log_dir, "args.json"), "w") as args_file:
+    json.dump(vars(args), args_file, indent=2)
 
 
 # per-component floors on the error normalization (pos, rot, lin vel, ang vel, q, qd increments)
@@ -127,6 +142,7 @@ def _critic_input(S, f, xi_n, g):
 
 wm_rollout = torch.compile(_wm_rollout)
 wm_err = torch.compile(_wm_err)
+grounding_losses = torch.compile(wm.grounding_losses) if args.wm_latent_dim else None
 imag_step = torch.compile(_imag_step)
 reward_term = torch.compile(_reward_term)
 critic_input_c = torch.compile(_critic_input)
@@ -148,12 +164,19 @@ def wm_update():
     w = buffer.sample_windows(args.wm_batch, args.wm_window)
     S_hat = wm_rollout(w["s"], w["a"], w["xi"])
     loss, e_last = wm_err(S_hat, w["s1"], w["mask"])
+    state_loss = idm_loss = loss.detach().new_zeros(())
+    if args.wm_state_weight or args.wm_idm_weight:
+        state_loss, idm_loss = grounding_losses(
+            unflatten_state(w["s"]), unflatten_state(w["s1"]), w["a"], normalize_xi(w["xi"]), w["mask"]
+        )
+    total_loss = loss + args.wm_state_weight * state_loss + args.wm_idm_weight * idm_loss
     opt_wm.zero_grad(set_to_none=True)
-    loss.backward()
+    total_loss.backward()
     nn.utils.clip_grad_norm_(wm.parameters(), 1.0)
     opt_wm.step()
     m = w["mask"][:, -1]
-    return loss.detach() / args.wm_window, (e_last.detach() * m).sum() / m.sum().clamp(min=1)
+    return (loss.detach() / args.wm_window, (e_last.detach() * m).sum() / m.sum().clamp(min=1),
+            state_loss.detach() / args.wm_window, idm_loss.detach() / args.wm_window)
 
 
 def sample_valid_starts(B: int):
@@ -290,15 +313,18 @@ with launch_simulation(sim_cfg, args):
                 stats["done"].append(out["done"].float().sum())
 
     stats = {"r": [], "ep_len": [], "ep_ret": [], "term": [], "done": []}
-    if start_it == 0:
-        collect(args.warmup_steps, stats)
+    # Replay is not serialized. A resumed model needs a fresh buffer too.
+    collect(max(args.warmup_steps, args.wm_window), stats)
     log_f = open(os.path.join(args.log_dir, "train_log.csv"), "a")
-    if start_it == 0:
+    if log_f.tell() == 0:
         log_f.write("iteration,wall_h,sim_steps,wm_loss,wm_err8,pi_loss,v_loss,imag_rew,pi_gradnorm,imag_survival,sim_rew,ep_len,ep_ret_norm,term_frac,it_per_s,lr\n")
+    grounding_f = open(os.path.join(args.log_dir, "grounding_log.csv"), "a") if args.wm_latent_dim else None
+    if grounding_f is not None and grounding_f.tell() == 0:
+        grounding_f.write("iteration,state_loss,idm_loss\n")
     t_start = time.time() - wall_offset
     t_log = time.time()
     step_acc = 0.0
-    agg = {"wm": [], "wm8": [], "pi": [], "v": [], "ir": [], "gn": [], "surv": []}
+    agg = {"wm": [], "wm8": [], "pi": [], "v": [], "ir": [], "gn": [], "surv": [], "state": [], "idm": []}
     for it in range(start_it, args.iterations):
         lr = lr_at(it)
         for o in (opt_wm, opt_pi, opt_v):
@@ -314,10 +340,11 @@ with launch_simulation(sim_cfg, args):
         if prof:
             torch.cuda.synchronize(); tp1 = time.time()
         for _ in range(args.wm_batches):
-            l, e8 = wm_update()
+            l, e8, state_loss, idm_loss = wm_update()
         if prof:
             torch.cuda.synchronize(); tp2 = time.time()
         agg["wm"].append(l), agg["wm8"].append(e8)
+        agg["state"].append(state_loss), agg["idm"].append(idm_loss)
         if it >= args.wm_only_iters:
             pl, vl, ir, gn, surv = policy_update()
             if prof:
@@ -334,6 +361,9 @@ with launch_simulation(sim_cfg, args):
                    mean(agg["gn"]), mean(agg["surv"]), mean(stats["r"]), mean(stats["ep_len"]), mean(stats["ep_ret"]), term_frac, ips, lr]  # fmt: skip
             log_f.write(",".join(f"{x:.6g}" if isinstance(x, float) else str(x) for x in row) + "\n")
             log_f.flush()
+            if grounding_f is not None:
+                grounding_f.write(f"{it + 1},{mean(agg['state']):.6g},{mean(agg['idm']):.6g}\n")
+                grounding_f.flush()
             print(f"it {it + 1} | {wall_h:.3f} h | wm {row[3]:.4f} e8 {row[4]:.4f} | pi {row[5]:.3f} v {row[6]:.4f} imag_r {row[7]:.3f} surv {row[9]:.3f} "
                   f"| sim_r {row[10]:.3f} ep_len {row[11]:.1f} ep_ret {row[12]:.3f} term {term_frac:.2f} | {ips:.2f} it/s", flush=True)  # fmt: skip
             stats = {k: [] for k in stats}
@@ -342,11 +372,14 @@ with launch_simulation(sim_cfg, args):
             ck = {"wm": wm.state_dict(), "pi": pi.state_dict(), "critic": critic.state_dict(), "opt_wm": opt_wm.state_dict(),
                   "opt_pi": opt_pi.state_dict(), "opt_v": opt_v.state_dict(), "iteration": it + 1,
                   "wall_time": time.time() - t_start, "sim_steps": sim_steps, "args": vars(args),
+                  "peak_gpu_allocated_bytes": torch.cuda.max_memory_allocated(dev),
+                  "peak_gpu_reserved_bytes": torch.cuda.max_memory_reserved(dev),
                   "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}  # fmt: skip
             last = os.path.join(args.log_dir, "last.pt")
             torch.save(ck, last + ".tmp")
             os.replace(last + ".tmp", last)
-            small = {k: ck[k] for k in ("pi", "wm", "iteration", "wall_time", "sim_steps", "args", "saved_at")}
+            small = {k: ck[k] for k in ("pi", "wm", "iteration", "wall_time", "sim_steps", "args", "saved_at",
+                                       "peak_gpu_allocated_bytes", "peak_gpu_reserved_bytes")}
             path = os.path.join(args.log_dir, f"ckpt_{it + 1:06d}.pt")
             torch.save(small, path + ".tmp")
             os.replace(path + ".tmp", path)

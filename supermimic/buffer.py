@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from .mdp import STATE_DIM, XI_DIM
+from .state import STATE_DIM, XI_DIM
 
 FIELDS = {
     "s": (STATE_DIM, torch.float32),
@@ -40,6 +40,8 @@ class ReplayBuffer:
 
     def sample_windows(self, B: int, k: int):
         """k-step windows; returns dict of (B, k, ...) tensors and a validity mask (B, k)."""
+        if k < 1 or k > self.size:
+            raise ValueError(f"need {k} replay steps, have {self.size}; collect transitions before sampling")
         t0 = torch.randint(0, self.size - k + 1, (B,), device=self.device)
         env = torch.randint(0, self.N, (B,), device=self.device)
         ages = t0.unsqueeze(-1) + torch.arange(k, device=self.device)
@@ -54,6 +56,8 @@ class ReplayBuffer:
 
     def sample_starts(self, B: int, hist: int):
         """Start points for imagination plus the indices of their observation history (oldest first)."""
+        if self.size == 0 or hist < 1:
+            raise ValueError("imagination requires a nonempty replay buffer and hist >= 1")
         age = torch.randint(0, self.size, (B,), device=self.device)
         env = torch.randint(0, self.N, (B,), device=self.device)
         row = self._row(age)

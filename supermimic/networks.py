@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .mdp import INV_DIM, NUM_J, XI_DIM, invariant_features
+from .state import INV_DIM, NUM_J, XI_DIM, invariant_features
 from .rotations import so3_exp, yaw_mat
 
 
@@ -67,10 +67,21 @@ def run_mlp(net: nn.Module, x: torch.Tensor) -> torch.Tensor:
 class WorldModel(nn.Module):
     """Deterministic dynamics s_{t+1} = f(s_t, a_t, xi) predicting frame-local state increments."""
 
-    def __init__(self, hidden=(2048, 2048, 2048)):
+    def __init__(self, hidden=(2048, 2048, 2048), latent_dim: int = 0):
         super().__init__()
+        if latent_dim < 0:
+            raise ValueError("latent_dim must be nonnegative (0 selects the original model)")
+        self.latent_dim = latent_dim
         self.in_dim = INV_DIM + NUM_J + XI_DIM
-        self.net = mlp(self.in_dim, list(hidden), WM_OUT, act=nn.SiLU, layer_norm=True)
+        dynamics_in = self.in_dim
+        if latent_dim:
+            # Encode only state: giving this encoder the action would let the IDM
+            # head copy its target instead of learning controllable state features.
+            self.encoder = mlp(INV_DIM, [256, 256], latent_dim, act=nn.SiLU, layer_norm=True)
+            self.state_head = mlp(2 * latent_dim, [256], INV_DIM, act=nn.SiLU)
+            self.idm_head = mlp(2 * latent_dim + XI_DIM, [256], NUM_J, act=nn.SiLU)
+            dynamics_in = latent_dim + NUM_J + XI_DIM
+        self.net = mlp(dynamics_in, list(hidden), WM_OUT, act=nn.SiLU, layer_norm=True)
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
         self.in_norm = RunningNorm(self.in_dim)
@@ -78,6 +89,33 @@ class WorldModel(nn.Module):
 
     def inputs(self, S, a, xi_n):
         return torch.cat((invariant_features(S), a, xi_n), -1)
+
+    def state_features(self, S):
+        """Normalize state with the same statistics used by the dynamics input."""
+        return (invariant_features(S) - self.in_norm.mean[:INV_DIM]) / self.in_norm.std()[:INV_DIM]
+
+    def grounding_losses(self, S, S1, a, xi_n, mask):
+        """GAWM-inspired state alignment and inverse dynamics on real transitions.
+
+        Both losses train the action-free encoder shared with ``step``. The heads
+        use the actual successor before reset, never the next replay row. Context
+        helps disambiguate the inverse dynamics under randomized joint offsets.
+        Sum over valid time steps / batch, matching the existing rollout loss.
+        """
+        if not self.latent_dim:
+            raise ValueError("grounding losses require latent_dim > 0")
+        x, x1 = self.state_features(S), self.state_features(S1)
+        pair = torch.cat((run_mlp(self.encoder, x), run_mlp(self.encoder, x1)), -1)
+        ctx = (xi_n - self.in_norm.mean[-XI_DIM:]) / self.in_norm.std()[-XI_DIM:]
+        action_slice = slice(INV_DIM, INV_DIM + NUM_J)
+        target_a = (a - self.in_norm.mean[action_slice]) / self.in_norm.std()[action_slice]
+        state_error = (run_mlp(self.state_head, pair) - x1.detach()).square().mean(-1)
+        action_error = (run_mlp(self.idm_head, torch.cat((pair, ctx), -1)) - target_a.detach()).square().mean(-1)
+        valid = mask.bool()
+        return (
+            state_error.masked_fill(~valid, 0.0).sum() / mask.shape[0],
+            action_error.masked_fill(~valid, 0.0).sum() / mask.shape[0],
+        )
 
     @staticmethod
     def targets(S, S1):
@@ -102,7 +140,10 @@ class WorldModel(nn.Module):
 
     def step(self, S, a, xi_n):
         p, R, v, w, q, qd = S
-        y = run_mlp(self.net, self.in_norm(self.inputs(S, a, xi_n)))
+        x = self.in_norm(self.inputs(S, a, xi_n))
+        if self.latent_dim:
+            x = torch.cat((run_mlp(self.encoder, x[..., :INV_DIM]), x[..., INV_DIM:]), -1)
+        y = run_mlp(self.net, x)
         d = y * self.out_norm.std() + self.out_norm.mean
         H = yaw_mat(R)
         dp, dth, dv, dw, dq, dqd = d.split((3, 3, 3, 3, NUM_J, NUM_J), -1)
