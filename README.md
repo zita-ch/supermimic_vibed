@@ -130,7 +130,7 @@ The first iterations are slow while `torch.compile` builds its kernels (cached i
 Checkpoints are written every 2000 iterations to `logs/<run>/`; the eval watcher scores each on all
 40 clips and appends to `logs/<run>/eval.csv`.
 
-### Community-trained checkpoint
+### Community-trained checkpoint (Not Official)
 
 [G1 policy weights on Hugging Face](https://huggingface.co/pantelismanouselis/g1-supermimic-lafan1),
 published by Pantelis Manouselis, include evaluation results and motion videos.
