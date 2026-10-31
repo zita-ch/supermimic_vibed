@@ -130,6 +130,15 @@ The first iterations are slow while `torch.compile` builds its kernels (cached i
 Checkpoints are written every 2000 iterations to `logs/<run>/`; the eval watcher scores each on all
 40 clips and appends to `logs/<run>/eval.csv`.
 
+### Community-trained checkpoint (Not Official)
+
+[G1 policy weights on Hugging Face](https://huggingface.co/pantelismanouselis/g1-supermimic-lafan1),
+published by Pantelis Manouselis, include evaluation results and motion videos.
+This separate training run reached normalized return **0.8696**, with **0/40 failed training clips**.
+The inference-only release uses Safetensors. Follow the
+[compatible fork's loading instructions](https://github.com/Manouselis/supermimic_vibed_fork/blob/8bdf60a74c700720817669539e160f4f846b0cf4/docs/RELEASE.md).
+The local `.pt` workflow above is unchanged.
+
 ## Result (LAFAN1, 40 clips, one RTX PRO 6000 Blackwell)
 
 Evaluation return 0.824 at 1.24 h of training (paper: 0.82 at 1.2 h on an H100) and 0.829 with
