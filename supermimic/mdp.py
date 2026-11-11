@@ -15,10 +15,10 @@ from .kinematics import G1Kinematics
 from .motion import CONTROL_DT, MotionLib
 from .rotations import mat_to_6d, quat_to_mat, mat_to_quat, rot_angle_sq, yaw_mat
 
-OBS_DIM = 29 + 29 + 3 + 3 + 29 + 6
+OBS_DIM = 29 + 29 + 3 + 3 + 29
 NUM_J = 29
 
-# Table A.1 sensor noise (uniform half-widths), plus the reference-relative orientation
+# Table A.1 sensor noise (uniform half-widths)
 OBS_NOISE = torch.cat(
     (
         torch.full((29,), 0.01),
@@ -26,13 +26,10 @@ OBS_NOISE = torch.cat(
         torch.full((3,), 0.2),
         torch.full((3,), 0.05),
         torch.zeros(29),
-        torch.full((6,), 0.05),
     )
 )
 # normalization of the obs before the policy (qd and angular velocity are large)
-OBS_SCALE = torch.cat(
-    (torch.ones(29), torch.full((29,), 0.1), torch.full((3,), 0.25), torch.ones(3), torch.ones(29), torch.ones(6))
-)
+OBS_SCALE = torch.cat((torch.ones(29), torch.full((29,), 0.1), torch.full((3,), 0.25), torch.ones(3), torch.ones(29)))
 MAX_STEP_REWARD = (4 * 1.0 + 2 * 0.5) * CONTROL_DT
 
 
@@ -92,14 +89,13 @@ class MDP:
         self.obs_scale = OBS_SCALE.to(dev)
 
     # ---------------- observation ----------------
-    def obs(self, S, a_prev, xi, f) -> torch.Tensor:
-        """Noise-free proprioceptive observation (+ reference-relative root orientation)."""
+    def obs(self, S, a_prev, xi) -> torch.Tensor:
+        """Noise-free proprioceptive observation (the reference-relative orientation lives in the goal)."""
         p, R, v, w, q, qd = S
         Rt = R.transpose(-1, -2)
         dq0 = xi[..., 1:30]
         g_b = -R[..., 2, :]  # R^T (0,0,-1)
-        rel = mat_to_6d(Rt @ self.motion.root_R[f])
-        return torch.cat((q - self.default_q - dq0, qd, (Rt @ w.unsqueeze(-1)).squeeze(-1), g_b, a_prev, rel), -1)
+        return torch.cat((q - self.default_q - dq0, qd, (Rt @ w.unsqueeze(-1)).squeeze(-1), g_b, a_prev), -1)
 
     def add_noise(self, o: torch.Tensor) -> torch.Tensor:
         return o + (2 * torch.rand_like(o) - 1) * self.obs_noise
@@ -160,12 +156,11 @@ class MDP:
         alive = (1 - torch.sigmoid((e_z - self.cfg.term_height) / tz)) * (1 - torch.sigmoid((e_tilt - self.cfg.term_tilt) / tt))
         return 1 - alive
 
-    def critic_features(self, S, f, xi) -> torch.Tensor:
-        """Critic input: invariant state, goal, sim context, and robot-vs-reference errors."""
+    def critic_features(self, S, f, xi_n, wm_goal) -> torch.Tensor:
+        """Critic input: invariant state, robot-vs-reference errors, sim context, and the privileged goal."""
         m = self.motion
         p, R, v, w, q, qd = S
-        H = yaw_mat(R)
-        Ht = H.transpose(-1, -2)
+        Ht = yaw_mat(R).transpose(-1, -2)
         rp, rR = m.root_p[f], m.root_R[f]
         bp = self.kin.forward(p, R, v, w, q, qd)[0]
         dR = yaw_mat(R @ rR.transpose(-1, -2))
@@ -173,11 +168,10 @@ class MDP:
         ref_bp = anchor.unsqueeze(-2) + ((dR.unsqueeze(-3) @ (m.body_p[f] - rp.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1))
         e_body = (Ht.unsqueeze(-3) @ (ref_bp - bp).unsqueeze(-1)).squeeze(-1).flatten(-2)
         e_root = (Ht @ (rp - p).unsqueeze(-1)).squeeze(-1)
-        rel = mat_to_6d(R.transpose(-1, -2) @ rR)
-        return torch.cat((invariant_features(S), m.q[f] - q, e_body, e_root, rel, xi), -1)
+        return torch.cat((invariant_features(S), m.q[f] - q, e_body, e_root, xi_n, wm_goal), -1)
 
 
-CRITIC_EXTRA = 29 + 14 * 3 + 3 + 6 + XI_DIM
+CRITIC_EXTRA = 29 + 14 * 3 + 3 + XI_DIM  # plus INV_DIM and WM_GOAL_DIM
 
 
 def normalize_xi(xi: torch.Tensor) -> torch.Tensor:

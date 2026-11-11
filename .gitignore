@@ -10,6 +10,7 @@ data/
 # training runs: checkpoints, logs
 logs/
 *.pt
+!checkpoints/lafan1_g1_it10000.pt
 # rendered videos and recorded trajectories (derived from CC BY-NC-ND LAFAN1 motions)
 *.mp4
 *.npz

@@ -13,6 +13,11 @@ from .rotations import mat_to_6d, quat_slerp, quat_to_mat, so3_log, yaw_mat
 
 CONTROL_DT = 0.02
 BIN_FRAMES = 50  # 1 s bins for return-based reset sampling
+# Goal window: GOAL_FRAMES reference frames GOAL_STRIDE control steps apart (~0.9 s lookahead).
+GOAL_FRAMES = 10
+GOAL_STRIDE = 5
+ACTOR_GOAL_DIM = GOAL_FRAMES * (29 + 29 + 3 + 3 + 3 + 6)
+WM_GOAL_DIM = ACTOR_GOAL_DIM + GOAL_FRAMES * 3
 
 
 class MotionLib:
@@ -97,24 +102,33 @@ class MotionLib:
         fut = f.unsqueeze(-1) + torch.arange(1, K + 1, device=f.device)
         return torch.minimum(fut, end.unsqueeze(-1))
 
-    def goal(self, f: torch.Tensor, K: int) -> torch.Tensor:
-        """K future reference frames, holding the final pose with zero velocity beyond the clip."""
-        fut = self.future_frames(f, K)  # (B,K)
-        requested = f.unsqueeze(-1) + torch.arange(1, K + 1, device=f.device)
-        recorded = (requested <= self.clip_end[self.clip_id[f]].unsqueeze(-1)).unsqueeze(-1)
-        # Keep the recorded last-frame velocity; only the synthetic held-pose
-        # extension is stationary. Do not change velocities in ref_state/rewards.
-        v = torch.where(recorded, self.root_v_local[fut], 0.0)
-        w = torch.where(recorded, self.root_w_local[fut], 0.0)
-        qd = torch.where(recorded, self.qd[fut], 0.0)
-        H = yaw_mat(self.root_R[f])  # (B,3,3)
-        Ht = H.transpose(-1, -2).unsqueeze(1)
-        dp = (Ht @ (self.root_p[fut] - self.root_p[f].unsqueeze(1)).unsqueeze(-1)).squeeze(-1)
-        rot = mat_to_6d(Ht @ self.root_R[fut])
-        feats = torch.cat(
-            (dp, rot, v, w, self.q[fut], qd * 0.1), -1
-        )  # (B,K,73)
-        return feats.reshape(f.shape[0], -1)
+    def goal_frames(self, f: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Strided window f+1, f+1+S, ..., clamped to the clip's last frame, and which slots are recorded."""
+        end = self.clip_end[self.clip_id[f]].unsqueeze(-1)
+        requested = f.unsqueeze(-1) + 1 + torch.arange(GOAL_FRAMES, device=f.device) * GOAL_STRIDE
+        return torch.minimum(requested, end), requested <= end
+
+    def goal(self, f: torch.Tensor, p: torch.Tensor, R: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(actor_goal, wm_goal)`` from a strided window of future reference frames.
+
+        Per frame (actor, deployable): joint positions and velocities; the reference root trajectory in
+        the current reference heading frame (displacement and root-frame velocities, reference only);
+        and the reference root orientation relative to the robot root (6D, IMU-observable).
+        ``wm_goal`` (critic only) adds the reference root position relative to the robot root.
+        Slots beyond the clip hold the final pose with zero velocity.
+        """
+        fut, recorded = self.goal_frames(f)  # (B,N)
+        rec = recorded.unsqueeze(-1)
+        qd = torch.where(rec, self.qd[fut], 0.0)
+        v = torch.where(rec, self.root_v_local[fut], 0.0)
+        w = torch.where(rec, self.root_w_local[fut], 0.0)
+        Ht = yaw_mat(self.root_R[f]).transpose(-1, -2).unsqueeze(-3)
+        dp = (Ht @ (self.root_p[fut] - self.root_p[f].unsqueeze(-2)).unsqueeze(-1)).squeeze(-1)
+        Rt = R.transpose(-1, -2).unsqueeze(-3)
+        rel_ori = mat_to_6d(Rt @ self.root_R[fut])
+        rel_pos = (Rt @ (self.root_p[fut] - p.unsqueeze(-2)).unsqueeze(-1)).squeeze(-1)
+        actor = torch.cat((self.q[fut], qd * 0.1, dp, v, w, rel_ori), -1).flatten(-2)
+        return actor, torch.cat((actor, rel_pos.flatten(-2)), -1)
 
     def ref_state(self, f: torch.Tensor):
         return self.root_p[f], self.root_R[f], self.root_v[f], self.root_w[f], self.q[f], self.qd[f]

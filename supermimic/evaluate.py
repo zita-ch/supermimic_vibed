@@ -37,7 +37,7 @@ import supermimic.networks as networks
 from supermimic.env import TrackingSim, make_sim
 from supermimic.kinematics import G1Kinematics
 from supermimic.mdp import MAX_STEP_REWARD, OBS_DIM, MDP
-from supermimic.motion import MotionLib
+from supermimic.motion import ACTOR_GOAL_DIM, MotionLib
 from supermimic.networks import Policy
 from supermimic.robot import default_joint_pos_list
 
@@ -52,9 +52,9 @@ C = len(motion.names)
 @torch.no_grad()
 def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     a_ = ck["args"]
-    K, Hh = a_["goal_frames"], a_["hist"]
+    Hh = a_["hist"]
     networks.AMP_DTYPE = torch.bfloat16 if a_.get("amp", "none") == "bf16" else None
-    pi = Policy(OBS_DIM, 73 * K, hist=Hh).to(dev)
+    pi = Policy(OBS_DIM, ACTOR_GOAL_DIM, hist=Hh).to(dev)
     pi.load_state_dict(ck["pi"])
     pi.eval()
     ids = torch.arange(C, device=dev)
@@ -68,9 +68,9 @@ def evaluate(env: TrackingSim, ck: dict, record: str | None = None) -> dict:
     traj = {"root_p": [], "root_quat": [], "q": [], "f": [], "alive": []}
     while not bool(env.done_eval.all()):
         S = env.state()
-        o = mdp.obs(S, env.a_prev, env.xi, env.f)
+        o = mdp.obs(S, env.a_prev, env.xi)
         hist = o.unsqueeze(1).repeat(1, Hh, 1) if hist is None else torch.cat((hist[:, 1:], o.unsqueeze(1)), 1)
-        a = pi(hist, motion.goal(env.f, K))
+        a = pi(hist, motion.goal(env.f, S[0], S[1])[0])
         alive = ~env.done_eval.clone()
         if record:
             from supermimic.rotations import mat_to_quat

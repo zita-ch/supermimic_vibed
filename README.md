@@ -13,8 +13,9 @@ Author: **Chong Zhang** (ETH Zurich). License: [MIT](LICENSE).
 > for that: fast and unreviewed. Use it at
 > your own risk.
 
-> **One G1 motion tracker for all 40 LAFAN1 clips, trained in only ~1.5 GPU-hours**
-> (1.47 h on a single RTX PRO 6000): evaluation return **0.829** with **0/40 failed clips**.
+> **One G1 motion tracker for all 40 LAFAN1 clips, trained in only ~1 GPU-hour**
+> (0.95 h of training on a single RTX PRO 6000, 1.05 h including the checkpoint evaluations that
+> shared the GPU): evaluation return **0.842** with **0/40 failed clips**.
 > For scale, the paper's PPO-in-simulator baseline does not reach return 0.82 within 18 h on up to
 > 8 GPUs.
 
@@ -34,6 +35,7 @@ Progress and timestamps: [MILESTONES.md](MILESTONES.md).
 | `data/` | not tracked; `tools/download_data.sh` fetches LAFAN1 G1 retargets (HF `lvhaidong/LAFAN1_Retargeting_Dataset`) and the G1 URDF/meshes, then builds `g1_29dof.xml` (MJCF) and the USD |
 | `supermimic/` | implementation (see below) |
 | `tools/` | setup, asset conversion, tests, benchmark, plotting, rendering, failure analysis |
+| `checkpoints/` | `lafan1_g1_it10000.pt`: trained policy + world model (see below) |
 | `logs/<run>/` | not tracked: `train_log.csv`, `eval.csv`, checkpoints, stdout |
 | `results/` | success curve and highlight GIF (full videos are rendered locally with `tools/render.py`) |
 
@@ -65,7 +67,7 @@ which is equivalent to:
 git clone https://github.com/isaac-sim/IsaacLab.git
 git -C IsaacLab checkout 46d6cc3d7b115906fad12efd372fbf69f4e3d3ed
 (cd IsaacLab && docker build -f docker/Dockerfile.kitless -t isaac-lab-kitless:main-46d6cc3 .)
-docker build -t supermimic:latest docker/     # + tmux, ffmpeg, gcc, NVIDIA EGL vendor file
+docker build -t supermimic:latest docker/     # + tmux, ffmpeg, gcc
 ```
 
 Then start the long-lived container (repository mounted at `/workspace/supermimic`):
@@ -130,19 +132,26 @@ The first iterations are slow while `torch.compile` builds its kernels (cached i
 Checkpoints are written every 2000 iterations to `logs/<run>/`; the eval watcher scores each on all
 40 clips and appends to `logs/<run>/eval.csv`.
 
-### Community-trained checkpoint (Not Official)
+### Trained checkpoint
 
-[G1 policy weights on Hugging Face](https://huggingface.co/pantelismanouselis/g1-supermimic-lafan1),
-published by Pantelis Manouselis, include evaluation results and motion videos.
-This separate training run reached normalized return **0.8696**, with **0/40 failed training clips**.
-The inference-only release uses Safetensors. Follow the
-[compatible fork's loading instructions](https://github.com/Manouselis/supermimic_vibed_fork/blob/8bdf60a74c700720817669539e160f4f846b0cf4/docs/RELEASE.md).
-The local `.pt` workflow above is unchanged.
+[`checkpoints/lafan1_g1_it10000.pt`](checkpoints/lafan1_g1_it10000.pt) (71 MB) is the iteration-10000
+checkpoint of the 2026-11-11 run (policy and world model): normalized return **0.842**, **0/40 failed
+clips**. Evaluate it with:
+
+```bash
+docker exec supermimic python supermimic/evaluate.py --run_dir logs --ckpt checkpoints/lafan1_g1_it10000.pt
+```
+
+Checkpoints trained before 2026-11-11 (including community weights for the earlier version) do not
+load with the current code: the observation and goal sizes changed.
 
 ## Result (LAFAN1, 40 clips, one RTX PRO 6000 Blackwell)
 
-Evaluation return 0.824 at 1.24 h of training (paper: 0.82 at 1.2 h on an H100) and 0.829 with
-**0/40 failed clips** at 1.47 h (iteration 14000).
+Evaluation return **0.842 with 0/40 failed clips at 0.95 h of training** (iteration 10000; paper: 0.82
+at 1.2 h on an H100). The earlier version (v1, 2026-10-21) reached 0.82 at 1.11 h and 0/40 at 1.31 h.
+Times exclude the checkpoint evaluations, which ran on the same GPU during training (8 and 11 minutes
+deducted; method in the figure footnote and `tools/plot.py`). Including them: 1.05 h for v2; 1.24 h and
+1.47 h for v1.
 
 ![success curve](results/success_curve.png)
 
@@ -154,16 +163,18 @@ Evaluation return 0.824 at 1.24 h of training (paper: 0.82 at 1.2 h on an H100) 
   1 s bins — `supermimic/motion.py`, differentiable torch FK `supermimic/kinematics.py`
   (matches the simulator's link poses/velocities to 1e-6).
 * MDP (App. A): observation (q−q0, q̇, IMU ω, projected gravity, a_{t−1}; 10-frame history; Table A.1
-  noise), K=10 future reference frames as the goal, BeyondMimic tracking reward without the
+  noise), goal = 10 future reference frames 5 steps apart (~0.9 s lookahead), BeyondMimic tracking reward without the
   self-collision term and joint-limit weight −2, termination |e_z|>0.25 m or e_tilt>0.8, sim context
   ξ = (friction U[0.3,1.2], joint offsets U[±0.01], torso CoM offset) — `supermimic/mdp.py`.
 * Simulator wrapper with return-based reset sampling (50% uniform / 40% softmax(−25 G_b/G_max) /
   10% past-softmax) — `supermimic/env.py`.
 * World model f_ω: MLP(2048,2048,2048) on heading-invariant state features + action + ξ, predicting
-  frame-local increments; fit on k=8-step autoregressive windows (Eq. 1); analytic reward,
+  only acceleration-level increments (root linear/angular velocity, joint velocity); positions and
+  rotation are integrated analytically; fit on k=8-step autoregressive windows (Eq. 1) with fixed
+  per-group nominal errors; analytic reward,
   observation and termination heads — `supermimic/networks.py`, `supermimic/train.py`.
 * Policy: motion encoder MLP(2048,1024,512,256)->z∈R^32 (tanh), shared decoder
-  MLP(2048,1024,512,256); critic MLP(256,128). BPTT over H=32 imagined steps from replay-buffer
+  MLP(2048,1024,512,256); critic MLP(256,128); all MLPs use LayerNorm + GELU. BPTT over H=32 imagined steps from replay-buffer
   states with a soft survival weight and critic bootstrap (Eq. 2); critic on GAE(λ=0.95) targets
   (Eq. 3), 5 epochs × 4 minibatches.
 * Hyperparameters as Table A.5: 4096 envs, buffer 1000 steps/env, action noise N(0, 0.1²),
@@ -181,8 +192,9 @@ Evaluation return 0.824 at 1.24 h of training (paper: 0.82 at 1.2 h on an H100) 
   state integration, FK and rewards stay fp32.
 * Reward, observation and termination heads are **analytic** (allowed by §3.2); termination in
   imagination is a sigmoid-softened version of the hard thresholds.
-* The policy observation additionally contains the reference root orientation relative to the
+* The policy's goal contains, per future frame, the reference root orientation relative to the
   robot root (6D), i.e. BeyondMimic's `motion_anchor_ori_b` — IMU-observable; no global position.
+  The critic additionally sees the relative root position.
 * 500 world-model-only warm-up iterations before policy updates start.
 * Torso-CoM and friction are randomized once per environment at start-up (BeyondMimic's
   start-up events); joint offsets are resampled every episode. Episodes time out after 10 s or at
@@ -196,6 +208,16 @@ Evaluation return 0.824 at 1.24 h of training (paper: 0.82 at 1.2 h on an H100) 
   (`PhysxJointAPI` schema not registered), so the USD is converted once, offline, by
   `tools/mjcf_to_usd.py` (registers the importer's schema plugin first) and spawned with
   `UsdFileCfg(variants={"Physics": "mujoco"})`.
+
+## Changes
+
+**2026-11-11** — after comparing with the official release (`HybridRobotics/supermimic`), adopted what
+looked sound and verified it on the same 40-clip LAFAN1 run (figure above): acceleration-only world
+model with analytic integration and a nominal-error-weighted loss (root velocities also supervised);
+strided goal window (~0.9 s lookahead instead of 0.2 s) with the robot-relative reference orientation
+per frame; LayerNorm + GELU in all networks; critic values clamped to the maximum attainable return;
+optional `--optimizer muon` (off by default, untested). Result: 0/40 failed clips at 0.95 h instead of 1.31 h,
+return 0.842 instead of 0.829. One run per version, so the size of the gain is indicative only.
 
 ## Attribution and licenses
 

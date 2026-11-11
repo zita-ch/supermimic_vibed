@@ -20,7 +20,6 @@ parser.add_argument("--iterations", type=int, default=320_000)
 parser.add_argument("--buffer_steps", type=int, default=1000)
 parser.add_argument("--utd", type=float, default=0.4, help="updates per vectorized simulator step")
 parser.add_argument("--horizon", type=int, default=32)
-parser.add_argument("--goal_frames", type=int, default=10)
 parser.add_argument("--hist", type=int, default=10)
 parser.add_argument("--wm_window", type=int, default=8)
 parser.add_argument("--wm_batches", type=int, default=10)
@@ -43,6 +42,8 @@ parser.add_argument("--log_dir", type=str, default=os.path.join(REPO, "logs", "r
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--resume", type=str, default=None)
 parser.add_argument("--amp", type=str, default="bf16", choices=["none", "bf16"], help="autocast dtype for MLP matmuls")
+parser.add_argument("--optimizer", type=str, default="adam", choices=["adam", "muon"],
+                    help="muon: Muon on hidden Linear weights, Adam on the rest")
 add_launcher_args(parser)
 args = parser.parse_args()
 
@@ -52,8 +53,8 @@ import torch.nn as nn
 from supermimic.buffer import ReplayBuffer
 from supermimic.env import TrackingSim, make_sim
 from supermimic.kinematics import G1Kinematics
-from supermimic.mdp import CRITIC_EXTRA, INV_DIM, MDP, OBS_DIM, invariant_features, normalize_xi, unflatten_state
-from supermimic.motion import MotionLib
+from supermimic.mdp import CRITIC_EXTRA, INV_DIM, MAX_STEP_REWARD, MDP, OBS_DIM, normalize_xi, unflatten_state
+from supermimic.motion import ACTOR_GOAL_DIM, WM_GOAL_DIM, MotionLib
 import supermimic.networks as networks
 from supermimic.networks import Critic, Policy, WorldModel
 from supermimic.robot import default_joint_pos_list
@@ -69,27 +70,51 @@ json.dump(vars(args), open(os.path.join(args.log_dir, "args.json"), "w"), indent
 kin = G1Kinematics(dev)
 motion = MotionLib.from_dir(args.motion_dir, kin, dev)
 mdp = MDP(kin, motion, torch.tensor(default_joint_pos_list(), device=dev))
-K, Hh, HZ = args.goal_frames, args.hist, args.horizon
-GOAL_DIM = 73 * K
-CRITIC_IN = INV_DIM + CRITIC_EXTRA + GOAL_DIM
+Hh, HZ = args.hist, args.horizon
+CRITIC_IN = INV_DIM + CRITIC_EXTRA + WM_GOAL_DIM
+V_MAX = MAX_STEP_REWARD / (1 - args.gamma)
 
 wm = WorldModel().to(dev)
-pi = Policy(OBS_DIM, GOAL_DIM, hist=Hh).to(dev)
+pi = Policy(OBS_DIM, ACTOR_GOAL_DIM, hist=Hh).to(dev)
 critic = Critic(CRITIC_IN).to(dev)
-opt_wm = torch.optim.Adam(wm.parameters(), lr=args.lr)
-opt_pi = torch.optim.Adam(pi.parameters(), lr=args.lr, betas=(0.9, 0.95))
-opt_v = torch.optim.Adam(critic.parameters(), lr=args.lr)
+
+
+def build_optimizers(module: nn.Module, betas=(0.9, 0.999)) -> list[torch.optim.Optimizer]:
+    """Adam; with --optimizer muon, Muon on the hidden Linear weights of each MLP and Adam on the rest."""
+    if args.optimizer == "adam":
+        return [torch.optim.Adam(module.parameters(), lr=args.lr, betas=betas)]
+    hidden = [lin.weight for seq in module.modules() if isinstance(seq, nn.Sequential)
+              for lin in [m for m in seq if isinstance(m, nn.Linear)][1:-1]]  # fmt: skip
+    ids = {id(p) for p in hidden}
+    rest = [p for p in module.parameters() if id(p) not in ids]
+    return [torch.optim.Adam(rest, lr=args.lr, betas=betas), torch.optim.Muon(hidden, lr=args.lr, adjust_lr_fn="match_rms_adamw")]
+
+
+def opt_step(opts, loss, params, max_norm, clip_value=0.0):
+    params = list(params)  # a generator would be exhausted by the first clip
+    for o in opts:
+        o.zero_grad(set_to_none=True)
+    loss.backward()
+    gn = nn.utils.clip_grad_norm_(params, max_norm)
+    if clip_value > 0:
+        nn.utils.clip_grad_value_(params, clip_value)
+    if torch.isfinite(gn):
+        for o in opts:
+            o.step()
+    return gn
+
+
+opt_wm = build_optimizers(wm)
+opt_pi = build_optimizers(pi, betas=(0.9, 0.95))
+opt_v = build_optimizers(critic)
 start_it, wall_offset, sim_steps = 0, 0.0, 0
 if args.resume:
     ck = torch.load(args.resume, map_location=dev)
     wm.load_state_dict(ck["wm"]), pi.load_state_dict(ck["pi"]), critic.load_state_dict(ck["critic"])
-    opt_wm.load_state_dict(ck["opt_wm"]), opt_pi.load_state_dict(ck["opt_pi"]), opt_v.load_state_dict(ck["opt_v"])
+    for opts, key in ((opt_wm, "opt_wm"), (opt_pi, "opt_pi"), (opt_v, "opt_v")):
+        for o, sd in zip(opts, ck[key]):
+            o.load_state_dict(sd)
     start_it, wall_offset, sim_steps = ck["iteration"], ck["wall_time"], ck["sim_steps"]
-
-
-# per-component floors on the error normalization (pos, rot, lin vel, ang vel, q, qd increments)
-ERR_FLOOR = torch.cat((torch.full((3,), 3e-3), torch.full((3,), 5e-3), torch.full((3,), 2e-2), torch.full((3,), 5e-2),
-                       torch.full((29,), 3e-3), torch.full((29,), 5e-2))).to(dev)  # fmt: skip
 
 
 def _wm_rollout(s, a, xi):
@@ -102,27 +127,26 @@ def _wm_rollout(s, a, xi):
 
 
 def _wm_err(S_hat, s1, mask):
-    std = torch.maximum(wm.out_norm.std(), ERR_FLOOR)
-    e = (wm.state_error(S_hat, unflatten_state(s1)) / std) ** 2  # (B, k, D)
-    e = e.mean(-1)
-    return (e * mask).sum() / s1.shape[0], e[:, -1]
+    e = wm.weighted_sq_error(S_hat, unflatten_state(s1)).mean(-1)  # (B, k), Bryson-weighted
+    return (e * mask).sum() / mask.sum().clamp(min=1), e[:, -1]
 
 
 def _imag_step(S, o_hist, a_prev, f, xi, xi_n, g):
     a = pi(o_hist, g)
     S1 = wm.step(S, a, xi_n)
     f1 = f + 1
-    o1 = mdp.add_noise(mdp.obs(S1, a, xi, f1))
+    o1 = mdp.add_noise(mdp.obs(S1, a, xi))
     o_hist = torch.cat((o_hist[:, 1:], o1.unsqueeze(1)), 1)
-    return S1, a, o_hist, f1, motion.goal(f1, K)
+    g1, gw1 = motion.goal(f1, S1[0], S1[1])  # the relative-orientation terms carry gradient through S1
+    return S1, a, o_hist, f1, g1, gw1
 
 
 def _reward_term(S, f, a, a_prev):
     return mdp.reward(S, f, a, a_prev), mdp.soft_termination(S, f)
 
 
-def _critic_input(S, f, xi_n, g):
-    return torch.cat((mdp.critic_features(S, f, xi_n), g), -1)
+def _critic_input(S, f, xi_n, gw):
+    return mdp.critic_features(S, f, xi_n, gw)
 
 
 wm_rollout = torch.compile(_wm_rollout)
@@ -148,12 +172,9 @@ def wm_update():
     w = buffer.sample_windows(args.wm_batch, args.wm_window)
     S_hat = wm_rollout(w["s"], w["a"], w["xi"])
     loss, e_last = wm_err(S_hat, w["s1"], w["mask"])
-    opt_wm.zero_grad(set_to_none=True)
-    loss.backward()
-    nn.utils.clip_grad_norm_(wm.parameters(), 1.0)
-    opt_wm.step()
+    opt_step(opt_wm, loss, wm.parameters(), 1.0)
     m = w["mask"][:, -1]
-    return loss.detach() / args.wm_window, (e_last.detach() * m).sum() / m.sum().clamp(min=1)
+    return loss.detach(), (e_last.detach() * m).sum() / m.sum().clamp(min=1)
 
 
 def sample_valid_starts(B: int):
@@ -180,19 +201,19 @@ def policy_update():
     xi, f, a_prev = s["xi"], s["f"], s["a_prev"]
     xi_n = normalize_xi(xi)
     with torch.no_grad():
-        o_hist = mdp.obs(unflatten_state(h["s"]), h["a_prev"], h["xi"], h["f"])
+        o_hist = mdp.obs(unflatten_state(h["s"]), h["a_prev"], h["xi"])
     o_hist = mdp.add_noise(o_hist)
     set_requires_grad(wm, False)
     set_requires_grad(critic, False)
     B = args.pi_batch
-    g0 = motion.goal(f, K)
-    g = g0
+    g, gw0 = motion.goal(f, S[0], S[1])
+    gw = gw0
     S0 = S
-    Ss, As, Aps, Fs, Gs = [], [], [], [], []
+    Ss, As, Aps, Fs, Gws = [], [], [], [], []
     for t in range(HZ):
         Aps.append(a_prev)
-        S, a_prev, o_hist, f, g = imag_step(S, o_hist, a_prev, f, xi, xi_n, g)
-        Ss.append(S), As.append(a_prev), Fs.append(f), Gs.append(g)
+        S, a_prev, o_hist, f, g, gw = imag_step(S, o_hist, a_prev, f, xi, xi_n, g)
+        Ss.append(S), As.append(a_prev), Fs.append(f), Gws.append(gw)
     flat = lambda xs: torch.stack(xs).flatten(0, 1)  # noqa: E731  (H*B, ...)
     S_all = tuple(flat([St[i] for St in Ss]) for i in range(6))
     f_all = flat(Fs)
@@ -206,18 +227,13 @@ def policy_update():
     r_sum = (c_t * r).detach().sum(0)
     rews, dones = r.detach(), d.detach()
     if not args.no_critic:
-        J = J + (args.gamma**HZ) * c * critic(_critic_input(S, f, xi_n, g))
+        J = J + (args.gamma**HZ) * c * critic(_critic_input(S, f, xi_n, gw)).clamp(max=V_MAX)
     loss = -J.mean()
     if PROFILE:
         torch.cuda.synchronize(); tq1 = time.time()
-    opt_pi.zero_grad(set_to_none=True)
-    loss.backward()
+    gn = opt_step(opt_pi, loss, pi.parameters(), 1.0, clip_value=0.1)
     if PROFILE:
         torch.cuda.synchronize(); tq2 = time.time()
-    gn = nn.utils.clip_grad_norm_(pi.parameters(), 1.0)
-    nn.utils.clip_grad_value_(pi.parameters(), 0.1)
-    if torch.isfinite(gn):
-        opt_pi.step()
     set_requires_grad(wm, True)
     set_requires_grad(critic, True)
     # ---------------- critic: GAE(lambda) targets over the imagined transitions ----------------
@@ -226,18 +242,18 @@ def policy_update():
         with torch.no_grad():
             S_c = tuple(torch.cat((S0[i].unsqueeze(0), torch.stack([St[i].detach() for St in Ss])), 0).flatten(0, 1) for i in range(6))
             f_c = torch.cat((s["f"].unsqueeze(0), torch.stack(Fs)), 0).flatten()
-            g_c = torch.cat((g0.unsqueeze(0), torch.stack(Gs)), 0).flatten(0, 1)
+            g_c = torch.cat((gw0.unsqueeze(0), torch.stack(Gws)), 0).flatten(0, 1)
             xi_c = xi_n.unsqueeze(0).expand(HZ + 1, -1, -1).flatten(0, 1)
             X = critic_input_c(S_c, f_c, xi_c, g_c).view(HZ + 1, B, -1)
         critic.norm.update(X)
         with torch.no_grad():
-            V = critic(X)
+            V = critic(X).clamp(max=V_MAX)
             R = V[-1]
             targets = []
             for t in range(HZ - 1, -1, -1):
                 R = rews[t] + args.gamma * (1 - dones[t]) * ((1 - args.lam) * V[t + 1] + args.lam * R)
                 targets.append(R)
-            targets = torch.stack(targets[::-1])  # (H, B)
+            targets = torch.stack(targets[::-1]).clamp(max=V_MAX)  # (H, B)
         Xf, Yf = X[:-1].reshape(-1, X.shape[-1]), targets.reshape(-1)
         n = Xf.shape[0]
         mb = n // args.critic_minibatches
@@ -246,10 +262,7 @@ def policy_update():
             for i in range(args.critic_minibatches):
                 idx = perm[i * mb : (i + 1) * mb]
                 v_loss = ((critic(Xf[idx]) - Yf[idx]) ** 2).mean()
-                opt_v.zero_grad(set_to_none=True)
-                v_loss.backward()
-                nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
-                opt_v.step()
+                opt_step(opt_v, v_loss, critic.parameters(), 1.0)
     if PROFILE:
         torch.cuda.synchronize()
         print(f"[prof] imagine fwd {1e3*(tq1-tq0):.0f} ms | bwd {1e3*(tq2-tq1):.0f} ms | critic {1e3*(time.time()-tq2):.0f} ms", flush=True)
@@ -268,10 +281,10 @@ with launch_simulation(sim_cfg, args):
         global obs_hist, sim_steps
         for _ in range(n_steps):
             S = env.state()
-            o = mdp.add_noise(mdp.obs(S, env.a_prev, env.xi, env.f))
+            o = mdp.add_noise(mdp.obs(S, env.a_prev, env.xi))
             fresh = env.ep_step == 0
             obs_hist = torch.where(fresh[:, None, None], o.unsqueeze(1).expand_as(obs_hist), torch.cat((obs_hist[:, 1:], o.unsqueeze(1)), 1))
-            g = motion.goal(env.f, K)
+            g, _ = motion.goal(env.f, S[0], S[1])
             pi.obs_norm.update(o)
             pi.goal_norm.update(g)
             a = pi(obs_hist, g)
@@ -301,7 +314,7 @@ with launch_simulation(sim_cfg, args):
     agg = {"wm": [], "wm8": [], "pi": [], "v": [], "ir": [], "gn": [], "surv": []}
     for it in range(start_it, args.iterations):
         lr = lr_at(it)
-        for o in (opt_wm, opt_pi, opt_v):
+        for o in (*opt_wm, *opt_pi, *opt_v):
             for gparam in o.param_groups:
                 gparam["lr"] = lr
         step_acc += 1.0 / args.utd
@@ -339,8 +352,8 @@ with launch_simulation(sim_cfg, args):
             stats = {k: [] for k in stats}
             agg = {k: [] for k in agg}
         if (it + 1) % args.ckpt_every == 0 or it + 1 == args.iterations:
-            ck = {"wm": wm.state_dict(), "pi": pi.state_dict(), "critic": critic.state_dict(), "opt_wm": opt_wm.state_dict(),
-                  "opt_pi": opt_pi.state_dict(), "opt_v": opt_v.state_dict(), "iteration": it + 1,
+            ck = {"wm": wm.state_dict(), "pi": pi.state_dict(), "critic": critic.state_dict(), "opt_wm": [o.state_dict() for o in opt_wm],
+                  "opt_pi": [o.state_dict() for o in opt_pi], "opt_v": [o.state_dict() for o in opt_v], "iteration": it + 1,
                   "wall_time": time.time() - t_start, "sim_steps": sim_steps, "args": vars(args),
                   "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")}  # fmt: skip
             last = os.path.join(args.log_dir, "last.pt")
